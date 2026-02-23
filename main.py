@@ -1,15 +1,16 @@
 """
 PROJECT LIMITLESS: Cursed Energy AR Engine
-Phase 3-6 — Cursed Energy Techniques
 
-Layout:
-  - Fullscreen Infinity Void (1280×720) — pure black canvas
-  - Floating PiP webcam overlay (small, bottom-left) — hand tracking controller
+Flow:
+  1. Real World Mode — fullscreen webcam with hand tracking
+  2. Cross right-hand fingers → Domain Expansion transition (with SFX)
+  3. Infinity Void — cursed energy techniques (Blue, Red, Purple)
 
 Techniques:
-  - BLUE (Lapse)  — Namaste spawn, left hand control, left fist dismiss
+  - BLUE (Lapse)  — Left crossed fingers spawn, left hand control, left fist dismiss
   - RED (Reversal) — Hands-apart spawn, right hand control, right fist dismiss
   - PURPLE (Hollow) — Blue+Red collision, cinematic merge, right hand control
+  - DOMAIN EXPANSION — Right crossed fingers destroys Purple (when active)
 
   - 'q' to quit
 """
@@ -18,9 +19,11 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import sys
+import os
 import time
 import math
 import random
+import pygame
 
 
 # ──────────────────────────────────────────────
@@ -65,8 +68,9 @@ PALM_WEIGHT = 0.6            # How much palm movement contributes
 NAMASTE_THRESHOLD = 0.14         # Max normalized distance for namaste
 APART_THRESHOLD = 0.45           # Min normalized distance for hands-apart
 FIST_CURL_RATIO = 0.85           # Fingertip must be this % closer to wrist than MCP
-CROSSED_FINGER_THRESHOLD = 0.02  # How close index/middle tips must cross
+CROSSED_FINGER_THRESHOLD = 0.04  # How close index/middle tips must cross
 FIST_FRAMES_REQUIRED = 3         # Consecutive fist frames before triggering
+CROSSED_FRAMES_REQUIRED = 5      # Consecutive crossed-finger frames before trigger
 
 # ──────────────────────────────────────────────
 # CURSED ENERGY CONFIG
@@ -83,6 +87,13 @@ SPAWN_SCALE_SPEED = 0.04         # How fast energy scales up during spawning
 EXPLOSION_FRAMES = 60            # Duration of explosion effect (~2 sec)
 EXPLOSION_MAX_RADIUS = 500       # How big the shockwave expands
 EXPLOSION_RING_COUNT = 4         # Number of expanding rings
+
+# ── Scene Transition ──
+SCENE_REAL_WORLD = 0
+SCENE_TRANSITION = 1
+SCENE_VOID = 2
+TRANSITION_FRAMES = 100          # ~3.3 sec at 30fps
+SFX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "domain_expansion.wav")
 
 
 # ──────────────────────────────────────────────
@@ -113,6 +124,10 @@ class GestureDetector:
         # Debounce counters for fist detection
         self.left_fist_frames = 0
         self.right_fist_frames = 0
+
+        # Debounce counters for crossed fingers
+        self.left_crossed_frames = 0
+        self.right_crossed_frames = 0
 
         # Store previous gesture state for edge detection
         self.prev_state = self._empty_state()
@@ -184,34 +199,49 @@ class GestureDetector:
 
     def _is_crossed_fingers(self, landmarks):
         """
-        Detect crossed index + middle fingers on the right hand.
-        Domain Expansion trigger: middle finger tip crosses over index finger tip.
+        Detect crossed index + middle fingers.
+        Strict detection: index & middle extended, ring & pinky curled,
+        AND the fingertips have physically crossed over in the x-axis.
         """
         index_tip = landmarks.landmark[self.INDEX_TIP]
         middle_tip = landmarks.landmark[self.MIDDLE_TIP]
         index_mcp = landmarks.landmark[self.INDEX_MCP]
         middle_mcp = landmarks.landmark[self.MIDDLE_MCP]
+        ring_tip = landmarks.landmark[self.RING_TIP]
+        ring_mcp = landmarks.landmark[self.RING_MCP]
+        pinky_tip = landmarks.landmark[self.PINKY_TIP]
+        pinky_mcp = landmarks.landmark[self.PINKY_MCP]
         wrist = landmarks.landmark[self.WRIST]
 
-        # Both fingers must be extended (not curled)
+        # 1. Index and middle MUST be extended
         index_extended = self._landmark_dist(index_tip, wrist) > self._landmark_dist(index_mcp, wrist)
         middle_extended = self._landmark_dist(middle_tip, wrist) > self._landmark_dist(middle_mcp, wrist)
-
         if not (index_extended and middle_extended):
             return False
 
-        # Check if tips have crossed over each other in x-axis
-        # Normally index is to one side of middle; crossed means they swap
-        mcp_gap = index_mcp.x - middle_mcp.x  # Natural gap direction
-        tip_gap = index_tip.x - middle_tip.x    # Current tip gap
+        # 2. Ring and pinky MUST be curled (not extended) — this is the key filter
+        #    A proper crossed-fingers pose has only index+middle out
+        ring_dist = self._landmark_dist(ring_tip, wrist)
+        ring_mcp_dist = self._landmark_dist(ring_mcp, wrist)
+        pinky_dist = self._landmark_dist(pinky_tip, wrist)
+        pinky_mcp_dist = self._landmark_dist(pinky_mcp, wrist)
 
-        # If the sign flipped (tips crossed), and they're close together
+        ring_curled = ring_dist < ring_mcp_dist * 1.1   # Slightly relaxed
+        pinky_curled = pinky_dist < pinky_mcp_dist * 1.1
+        if not (ring_curled or pinky_curled):  # At least one must be curled
+            return False
+
+        # 3. Tips must have crossed over in x-axis (sign flip)
+        mcp_gap = index_mcp.x - middle_mcp.x  # Natural gap direction
+        tip_gap = index_tip.x - middle_tip.x   # Current gap
+
+        # Sign must flip AND tips must be close together
         if mcp_gap * tip_gap < 0 and abs(tip_gap) < CROSSED_FINGER_THRESHOLD * 3:
             return True
 
-        # Also detect if tips are very close together (touching/crossing)
+        # 4. Tips are touching/overlapping (very close in both x and y)
         tip_dist = self._landmark_dist(index_tip, middle_tip)
-        if tip_dist < CROSSED_FINGER_THRESHOLD and index_extended and middle_extended:
+        if tip_dist < CROSSED_FINGER_THRESHOLD * 0.5:
             return True
 
         return False
@@ -248,10 +278,16 @@ class GestureDetector:
                 self.left_fist_frames = 0
             state["left_fist"] = self.left_fist_frames >= FIST_FRAMES_REQUIRED
 
-            # Crossed fingers on left hand (Blue trigger)
-            state["left_crossed_fingers"] = self._is_crossed_fingers(left_landmarks)
+            # Crossed fingers on left hand (Blue trigger) — with debounce
+            raw_left_crossed = self._is_crossed_fingers(left_landmarks)
+            if raw_left_crossed:
+                self.left_crossed_frames += 1
+            else:
+                self.left_crossed_frames = 0
+            state["left_crossed_fingers"] = self.left_crossed_frames >= CROSSED_FRAMES_REQUIRED
         else:
             self.left_fist_frames = 0
+            self.left_crossed_frames = 0
 
         # ── Right hand gestures ──
         if right_landmarks is not None:
@@ -265,10 +301,16 @@ class GestureDetector:
                 self.right_fist_frames = 0
             state["right_fist"] = self.right_fist_frames >= FIST_FRAMES_REQUIRED
 
-            # Crossed fingers (only right hand)
-            state["crossed_fingers"] = self._is_crossed_fingers(right_landmarks)
+            # Crossed fingers (right hand) — with debounce
+            raw_right_crossed = self._is_crossed_fingers(right_landmarks)
+            if raw_right_crossed:
+                self.right_crossed_frames += 1
+            else:
+                self.right_crossed_frames = 0
+            state["crossed_fingers"] = self.right_crossed_frames >= CROSSED_FRAMES_REQUIRED
         else:
             self.right_fist_frames = 0
+            self.right_crossed_frames = 0
 
         self.prev_state = state
         return state
@@ -930,7 +972,10 @@ class HandTracker:
 # ──────────────────────────────────────────────
 class LimitlessEngine:
     """
-    Main engine: Fullscreen Infinity Void with floating PiP controller overlay.
+    Main engine:
+      1. Real World — fullscreen webcam, hand tracking, await cross gesture
+      2. Transition — cinematic distortion + DOMAIN EXPANSION text + SFX
+      3. Infinity Void — cursed energy techniques with PiP controller
     """
 
     def __init__(self):
@@ -939,10 +984,33 @@ class LimitlessEngine:
         self.cap = None
         self.running = False
 
+        # Scene state
+        self.scene = SCENE_REAL_WORLD
+        self.transition_frame = 0
+        self.last_camera_frame = None  # Store last frame for transition
+        self.was_right_crossed = False  # Edge detection for real-world trigger
+
         # FPS tracking
         self.fps = 0
         self.frame_count = 0
         self.fps_timer = time.time()
+
+        # Sound
+        self._init_sound()
+
+    def _init_sound(self):
+        """Initialize pygame mixer for sound effects."""
+        try:
+            pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+            if os.path.exists(SFX_FILE):
+                self.domain_sfx = pygame.mixer.Sound(SFX_FILE)
+                print(f"[LIMITLESS] Sound loaded: {SFX_FILE}")
+            else:
+                self.domain_sfx = None
+                print(f"[LIMITLESS] Warning: {SFX_FILE} not found — no sound.")
+        except Exception as e:
+            self.domain_sfx = None
+            print(f"[LIMITLESS] Warning: Sound init failed ({e}) — no sound.")
 
     def _init_camera(self):
         """Initialize webcam with fallback support."""
@@ -963,6 +1031,90 @@ class LimitlessEngine:
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         print("[LIMITLESS] Camera initialized successfully.")
+
+    def _build_real_world_frame(self, tracked_frame):
+        """Build the Real World view — fullscreen webcam with hand tracking."""
+        # Resize tracked frame to full canvas size
+        canvas = cv2.resize(tracked_frame, (CANVAS_WIDTH, CANVAS_HEIGHT))
+
+        # Subtle hint text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        hint = "Cross right fingers to enter the Void..."
+        text_size = cv2.getTextSize(hint, font, 0.5, 1)[0]
+        tx = CANVAS_WIDTH // 2 - text_size[0] // 2
+        cv2.putText(canvas, hint, (tx, CANVAS_HEIGHT - 20),
+                    font, 0.5, (180, 180, 180), 1)
+
+        # FPS
+        cv2.putText(canvas, f"FPS: {self.fps:.0f}", (15, 25),
+                    font, 0.4, (0, 180, 180), 1)
+
+        return canvas
+
+    def _build_transition_frame(self, tracked_frame):
+        """
+        Build the Domain Expansion transition:
+        Progressive distortion + darkening + DOMAIN EXPANSION text → Void.
+        """
+        progress = self.transition_frame / TRANSITION_FRAMES  # 0.0 → 1.0
+
+        # Start with the camera frame resized to canvas
+        if tracked_frame is not None:
+            self.last_camera_frame = cv2.resize(tracked_frame, (CANVAS_WIDTH, CANVAS_HEIGHT))
+
+        if self.last_camera_frame is not None:
+            canvas = self.last_camera_frame.copy()
+        else:
+            canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
+
+        # ── Phase 1 (0.0-0.4): Darken + add noise ──
+        if progress < 0.4:
+            p = progress / 0.4  # 0→1 within this phase
+            darken = max(0.2, 1.0 - p * 0.8)
+            canvas = (canvas * darken).astype(np.uint8)
+
+            # Add noise/distortion
+            noise_intensity = int(30 * p)
+            if noise_intensity > 0:
+                noise = np.random.randint(-noise_intensity, noise_intensity,
+                                          canvas.shape, dtype=np.int16)
+                canvas = np.clip(canvas.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        # ── Phase 2 (0.3-0.7): DOMAIN EXPANSION text ──
+        if 0.15 < progress < 0.7:
+            text_p = (progress - 0.15) / 0.55  # 0→1 within this phase
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            overlay = canvas.copy()
+
+            # Main text grows in
+            scale = 0.6 + text_p * 0.6
+            text = "D O M A I N   E X P A N S I O N"
+            text_size = cv2.getTextSize(text, font, scale, 2)[0]
+            tx = CANVAS_WIDTH // 2 - text_size[0] // 2
+            ty = CANVAS_HEIGHT // 2
+
+            # Glow behind text
+            cv2.putText(overlay, text, (tx, ty), font, scale, (180, 50, 220), 4)
+            cv2.putText(overlay, text, (tx, ty), font, scale, (255, 255, 255), 2)
+
+            alpha = min(1.0, text_p * 2) * max(0.0, 1.0 - (text_p - 0.7) / 0.3) if text_p > 0.7 else min(1.0, text_p * 2)
+            cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+
+        # ── Phase 3 (0.4-0.8): Camera dissolves into black ──
+        if progress >= 0.4:
+            p = min(1.0, (progress - 0.4) / 0.4)  # 0→1
+            void = np.zeros_like(canvas)
+            cv2.addWeighted(canvas, 1.0 - p, void, p, 0, canvas)
+
+        # ── Phase 4 (0.7-1.0): Purple flash ──
+        if 0.7 < progress < 0.9:
+            flash_p = (progress - 0.7) / 0.2
+            flash_alpha = 0.3 * (1.0 - abs(flash_p - 0.5) * 2)
+            overlay = np.full_like(canvas, (80, 20, 100))  # Purple tint
+            cv2.addWeighted(overlay, flash_alpha, canvas, 1 - flash_alpha, 0, canvas)
+
+        return canvas
 
     def _build_canvas(self, controller_frame):
         """Build fullscreen Void with cursed energy techniques and PiP overlay."""
@@ -1095,21 +1247,24 @@ class LimitlessEngine:
             self.fps_timer = time.time()
 
     def run(self):
-        """Main application loop."""
+        """Main application loop with scene state machine."""
         self._init_camera()
         self.running = True
 
         print("\n" + "=" * 50)
         print("  PROJECT LIMITLESS — Cursed Energy Engine")
-        print("  Blue · Red · Purple")
+        print("  Real World → Domain Expansion → Infinity Void")
         print("=" * 50)
-        print("\n  Controls:")
+        print("\n  Phase 1: Real World")
+        print("  - Camera is live. Hand tracking active.")
+        print("  - Cross right-hand fingers → Enter the Void")
+        print("\n  Phase 2: Infinity Void")
         print("  - Cross fingers (L) → Spawn BLUE")
         print("  - Hands apart → Spawn RED")
         print("  - Move Blue+Red together → PURPLE merge")
         print("  - Left fist → Dismiss Blue")
         print("  - Right fist → Dismiss Red")
-        print("  - Cross fingers (R) while Purple active → DOMAIN EXPANSION!")
+        print("  - Cross fingers (R) while Purple → DOMAIN EXPANSION!")
         print("  - Press 'q' to quit")
         print("=" * 50 + "\n")
 
@@ -1118,17 +1273,40 @@ class LimitlessEngine:
             if not ret:
                 continue
 
-            # Process hand tracking on RAW frame (MediaPipe labels are accurate)
+            # Process hand tracking on RAW frame
             tracked_frame = self.tracker.process_frame(frame)
 
-            # THEN flip for mirror-like display
+            # Flip for mirror-like display
             tracked_frame = cv2.flip(tracked_frame, 1)
-
-            # Build canvas
-            canvas = self._build_canvas(tracked_frame)
 
             # Update FPS
             self._update_fps()
+
+            # ── Scene Router ──
+            if self.scene == SCENE_REAL_WORLD:
+                canvas = self._build_real_world_frame(tracked_frame)
+
+                # Check for right-hand crossed fingers to trigger transition
+                gs = self.tracker.gesture_state
+                if gs["crossed_fingers"] and not self.was_right_crossed:
+                    print("[LIMITLESS] Domain Expansion triggered!")
+                    self.scene = SCENE_TRANSITION
+                    self.transition_frame = 0
+                    # Play sound
+                    if self.domain_sfx:
+                        self.domain_sfx.play()
+                self.was_right_crossed = gs["crossed_fingers"]
+
+            elif self.scene == SCENE_TRANSITION:
+                canvas = self._build_transition_frame(tracked_frame)
+                self.transition_frame += 1
+
+                if self.transition_frame >= TRANSITION_FRAMES:
+                    self.scene = SCENE_VOID
+                    print("[LIMITLESS] Welcome to the Infinity Void.")
+
+            elif self.scene == SCENE_VOID:
+                canvas = self._build_canvas(tracked_frame)
 
             # Display
             cv2.imshow("PROJECT LIMITLESS", canvas)
@@ -1141,6 +1319,7 @@ class LimitlessEngine:
 
         self.cap.release()
         cv2.destroyAllWindows()
+        pygame.mixer.quit()
         print("[LIMITLESS] Engine terminated. See you in the Void.")
 
 
